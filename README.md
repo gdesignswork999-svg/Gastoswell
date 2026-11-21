@@ -42,6 +42,15 @@ Then open `http://127.0.0.1:3000/` in a supported browser and install Gastoswell
 
 Cloud sync is optional. The app keeps its encrypted local copy and remains usable offline. If two devices edit the workspace independently, choose which copy to keep when the app reports a conflict.
 
-## Current deployment status
+## Free preview deployment
 
-The PWA can be built and served locally. Public hosting and GitHub Pages/Vercel deployment configuration are not included.
+The repository includes a Render Blueprint in `render.yaml` for a free preview. It builds the Vite app and serves the frontend and API from the same Node.js service. For encrypted cloud sync, use a remote MySQL-compatible database such as TiDB Cloud Starter; the local XAMPP database at `127.0.0.1` cannot be reached by Render.
+
+1. Create a TiDB Cloud Starter instance and create the Gastoswell schema using `database/schema.sql` (or apply the encrypted-sync migration to an existing compatible database).
+2. In Render, create a Blueprint from this GitHub repository and select the `render.yaml` file.
+3. When prompted, enter the TiDB connection values for `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` as Render environment variables. Never add them to the repository or share them in chat.
+4. Deploy and wait for the logs to confirm `Encrypted sync is using MySQL database "..."`. Open the Render URL, create a test cloud account, then verify sign-in and sync before using the app on another device.
+
+The Blueprint enables TLS for the database connection, sets `COOKIE_SECURE=true`, and binds the service to `0.0.0.0`; Render supplies the `PORT` value. Keep the Render service and database in nearby regions when possible.
+
+This free setup is for preview/testing, not production: Render free web services sleep after inactivity and have ephemeral local storage. Keep backups, use test data only, and review the current provider limits before deployment. Do not expose XAMPP or phpMyAdmin to the public internet.

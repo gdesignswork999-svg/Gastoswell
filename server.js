@@ -45,7 +45,10 @@ const pool = databaseConfigured
       charset: 'utf8mb4',
       waitForConnections: true,
       connectionLimit: 5,
-      queueLimit: 0
+      queueLimit: 0,
+      ssl: process.env.DB_SSL === 'true'
+        ? { minVersion: 'TLSv1.2', rejectUnauthorized: true }
+        : undefined
     })
   : null;
 
