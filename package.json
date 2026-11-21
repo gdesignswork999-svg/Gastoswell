@@ -1,0 +1,25 @@
+{
+  "name": "gastoswell-app",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Responsive personal finance dashboard built with React and Node.js",
+  "scripts": {
+    "dev": "concurrently -k \"npm:server\" \"npm:vite\"",
+    "server": "node server.js",
+    "vite": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.1.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^6.1.0"
+  },
+  "devDependencies": {
+    "vite-plugin-pwa": "^2.0.0"
+  }
+}
