@@ -102,6 +102,60 @@ async function decryptWorkspace(payload, key) {
   return validateWorkspace(JSON.parse(textDecoder.decode(decrypted)));
 }
 
+async function syncRequest(endpoint, options = {}) {
+  const response = await fetch(endpoint, {
+    credentials: 'same-origin',
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...options.headers }
+  });
+  let result;
+  try {
+    result = await response.json();
+  } catch {
+    throw new Error('The sync server returned an invalid response.');
+  }
+  if (!response.ok) {
+    const requestError = new Error(result.error || 'Encrypted sync is temporarily unavailable.');
+    requestError.status = response.status;
+    requestError.result = result;
+    throw requestError;
+  }
+  return result;
+}
+
+async function cloudChallenge(username) {
+  const challenge = await syncRequest('/api/sync/challenge', {
+    method: 'POST',
+    body: JSON.stringify({ username })
+  });
+  const salt = base64ToBytes(challenge.salt);
+  if (salt.length !== 16) throw new Error('The sync server returned an invalid account salt.');
+  return salt;
+}
+
+async function cloudLogin(username, key) {
+  const verifier = await profileVerifier(key);
+  return syncRequest('/api/sync/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, verifier })
+  });
+}
+
+async function pushEncryptedWorkspace(profile, payload, version) {
+  const body = JSON.stringify({ payload, version });
+  const options = { method: 'PUT', body };
+  try {
+    return await syncRequest('/api/sync/workspace', options);
+  } catch (syncError) {
+    if (syncError.status !== 401) throw syncError;
+    await syncRequest('/api/sync/login', {
+      method: 'POST',
+      body: JSON.stringify({ username: profile.username, verifier: await profileVerifier(profile.key) })
+    });
+    return syncRequest('/api/sync/workspace', options);
+  }
+}
+
 function readLocalProfiles() {
   const stored = localStorage.getItem(ACCOUNT_STORE_KEY);
   if (!stored) return [];
@@ -116,7 +170,17 @@ async function persistProfileData(profile, workspace) {
   const profiles = readLocalProfiles();
   const index = profiles.findIndex((item) => item.id === profile.id);
   if (index < 0) throw new Error('This local account no longer exists on this device.');
-  profiles[index] = { ...profiles[index], payload: await encryptWorkspace(workspace, profile.key) };
+  const payload = await encryptWorkspace(workspace, profile.key);
+  profiles[index] = { ...profiles[index], payload };
+  localStorage.setItem(ACCOUNT_STORE_KEY, JSON.stringify(profiles));
+  return payload;
+}
+
+function updateLocalSyncState(profileId, syncVersion) {
+  const profiles = readLocalProfiles();
+  const index = profiles.findIndex((item) => item.id === profileId);
+  if (index < 0) throw new Error('This local account no longer exists on this device.');
+  profiles[index] = { ...profiles[index], syncEnabled: true, syncVersion };
   localStorage.setItem(ACCOUNT_STORE_KEY, JSON.stringify(profiles));
 }
 
@@ -223,6 +287,7 @@ function Icon({ name, size = 20 }) {
 function LocalAccountGate() {
   const [profiles, setProfiles] = useState(null);
   const [mode, setMode] = useState('login');
+  const [storageMode, setStorageMode] = useState('local');
   const [activeProfile, setActiveProfile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -255,8 +320,31 @@ function LocalAccountGate() {
       if (mode === 'create') {
         if (password.length < 8) throw new Error('Use a password with at least 8 characters.');
         if (password !== values.confirmPassword) throw new Error('The passwords do not match.');
-        if (currentProfiles.some((profile) => profile.username.toLowerCase() === username.toLowerCase())) {
-          throw new Error('That login name already exists on this device.');
+        const existingProfile = currentProfiles.find((profile) => profile.username.toLowerCase() === username.toLowerCase());
+        if (existingProfile) {
+          if (storageMode !== 'cloud') throw new Error('That login name already exists on this device.');
+          const existingKey = await deriveProfileKeys(password, base64ToBytes(existingProfile.salt));
+          if (await profileVerifier(existingKey) !== existingProfile.verifier) throw new Error('Invalid login name or password.');
+          const registration = await syncRequest('/api/sync/register', {
+            method: 'POST',
+            body: JSON.stringify({
+              id: existingProfile.id,
+              username: existingProfile.username,
+              salt: existingProfile.salt,
+              verifier: existingProfile.verifier,
+              payload: existingProfile.payload
+            })
+          });
+          updateLocalSyncState(existingProfile.id, registration.version);
+          setActiveProfile({
+            id: existingProfile.id,
+            username: existingProfile.username,
+            key: existingKey,
+            workspace: await decryptWorkspace(existingProfile.payload, existingKey),
+            syncEnabled: true,
+            syncVersion: registration.version
+          });
+          return;
         }
 
         const legacyData = currentProfiles.length === 0 ? localStorage.getItem(LEGACY_DATA_KEY) : null;
@@ -272,6 +360,28 @@ function LocalAccountGate() {
         };
         const nextProfiles = [...currentProfiles, profile];
         localStorage.setItem(ACCOUNT_STORE_KEY, JSON.stringify(nextProfiles));
+        let syncEnabled = false;
+        let syncVersion = null;
+        let syncWarning = '';
+        if (storageMode === 'cloud') {
+          try {
+            const registration = await syncRequest('/api/sync/register', {
+              method: 'POST',
+              body: JSON.stringify({
+                id: profile.id,
+                username: profile.username,
+                salt: profile.salt,
+                verifier: profile.verifier,
+                payload: profile.payload
+              })
+            });
+            syncEnabled = true;
+            syncVersion = registration.version;
+            updateLocalSyncState(profile.id, syncVersion);
+          } catch (syncError) {
+            syncWarning = `Your local account is ready, but cloud sync could not be enabled. ${syncError.message}`;
+          }
+        }
         let migrationWarning = '';
         if (legacyData) {
           try {
@@ -281,14 +391,89 @@ function LocalAccountGate() {
           }
         }
         setProfiles(nextProfiles);
-        setActiveProfile({ id: profile.id, username: profile.username, key, workspace, warning: migrationWarning });
+        setActiveProfile({
+          id: profile.id,
+          username: profile.username,
+          key,
+          workspace,
+          warning: [migrationWarning, syncWarning].filter(Boolean).join(' '),
+          syncEnabled,
+          syncVersion
+        });
       } else {
+        if (storageMode === 'cloud') {
+          const salt = await cloudChallenge(username);
+          const key = await deriveProfileKeys(password, salt);
+          const remote = await cloudLogin(username, key);
+          if (remote.salt !== bytesToBase64(salt)) throw new Error('The sync account salt changed. Sign in again.');
+          const workspace = await decryptWorkspace(remote.payload, key);
+          const existingProfile = currentProfiles.find((item) => item.id === remote.id);
+          const conflictingName = currentProfiles.find((item) =>
+            item.username.toLowerCase() === username.toLowerCase() && item.id !== remote.id);
+          if (conflictingName) {
+            throw new Error('A different local workspace already uses this login name. Open and back up that workspace before using this cloud account.');
+          }
+          const existingWorkspace = existingProfile
+            ? await decryptWorkspace(existingProfile.payload, key)
+            : null;
+          const hasConflict = existingWorkspace && JSON.stringify(existingWorkspace) !== JSON.stringify(workspace);
+          const syncedProfile = {
+            id: remote.id,
+            username: remote.username,
+            salt: remote.salt,
+            verifier: await profileVerifier(key),
+            payload: existingProfile?.payload || remote.payload,
+            syncEnabled: true,
+            syncVersion: remote.version
+          };
+          const nextProfiles = existingProfile
+            ? currentProfiles.map((item) => item.id === remote.id ? syncedProfile : item)
+            : [...currentProfiles, syncedProfile];
+          localStorage.setItem(ACCOUNT_STORE_KEY, JSON.stringify(nextProfiles));
+          setProfiles(nextProfiles);
+          setActiveProfile({
+            id: remote.id,
+            username: remote.username,
+            key,
+            workspace: hasConflict ? existingWorkspace : workspace,
+            syncEnabled: true,
+            syncVersion: remote.version,
+            syncConflict: hasConflict ? { workspace, payload: remote.payload, version: remote.version } : null
+          });
+          return;
+        }
         const profile = currentProfiles.find((item) => item.username.toLowerCase() === username.toLowerCase());
         if (!profile) throw new Error('Invalid login name or password.');
         const key = await deriveProfileKeys(password, base64ToBytes(profile.salt));
         if (await profileVerifier(key) !== profile.verifier) throw new Error('Invalid login name or password.');
-        const workspace = await decryptWorkspace(profile.payload, key);
-        setActiveProfile({ id: profile.id, username: profile.username, key, workspace });
+        let workspace = await decryptWorkspace(profile.payload, key);
+        let syncConflict = null;
+        let syncVersion = profile.syncVersion || null;
+        let syncWarning = '';
+        if (profile.syncEnabled) {
+          try {
+            const remote = await cloudLogin(profile.username, key);
+            const remoteWorkspace = await decryptWorkspace(remote.payload, key);
+            syncVersion = remote.version;
+            if (JSON.stringify(workspace) !== JSON.stringify(remoteWorkspace)) {
+              syncConflict = { workspace: remoteWorkspace, payload: remote.payload, version: remote.version };
+            } else {
+              workspace = remoteWorkspace;
+            }
+          } catch (syncError) {
+            syncWarning = `Opened your device copy. Cloud sync could not connect. ${syncError.message}`;
+          }
+        }
+        setActiveProfile({
+          id: profile.id,
+          username: profile.username,
+          key,
+          workspace,
+          warning: syncWarning,
+          syncEnabled: Boolean(profile.syncEnabled),
+          syncVersion,
+          syncConflict
+        });
       }
     } catch (accountError) {
       setError(accountError.message || 'Could not open this local account.');
@@ -298,10 +483,10 @@ function LocalAccountGate() {
   }
 
   if (activeProfile) {
-    return <App profile={activeProfile} onLogout={() => {
+    return <App profile={activeProfile} onLogout={(warning = '') => {
       setActiveProfile(null);
       setMode('login');
-      setError('');
+      setError(warning);
     }} />;
   }
   if (profiles === null) {
@@ -314,7 +499,7 @@ function LocalAccountGate() {
         <img src={gastoswellLogo} alt="" />
         <span>gastoswell<span>.</span><small>MONEY, IN BALANCE</small></span>
       </a>
-      <span className="landing-offline"><i />OFFLINE · NO EMAIL REQUIRED</span>
+      <span className="landing-offline"><i />PRIVATE · ENCRYPTED</span>
     </header>
     <main className="landing-content">
       <section className="landing-intro">
@@ -330,20 +515,25 @@ function LocalAccountGate() {
       <section className="local-auth-card" aria-labelledby="local-auth-title">
         <div className="local-auth-heading">
           <p className="eyebrow">{mode === 'create' ? 'GET STARTED' : 'WELCOME BACK'}</p>
-          <h2 id="local-auth-title">{mode === 'create' ? 'Create your account' : 'Open your workspace'}</h2>
-          <p>{mode === 'create' ? 'Choose a login name and password. No email needed.' : 'Sign in with the local account on this device.'}</p>
+          <h2 id="local-auth-title">{mode === 'create' ? 'Create your account' : storageMode === 'cloud' ? 'Sync your workspace' : 'Open your workspace'}</h2>
+          <p>{mode === 'create'
+            ? storageMode === 'cloud' ? 'Create a password-protected account with encrypted MySQL sync.' : 'Choose a login name and password. No email needed.'
+            : storageMode === 'cloud' ? 'Sign in to download your encrypted workspace.' : 'Sign in with the local account on this device.'}</p>
         </div>
         <form className="local-auth-form" onSubmit={submitAccount}>
           <label className="form-field"><span>Login name</span><input name="username" type="text" autoComplete="username" minLength="3" maxLength="24" placeholder="e.g. GDEV" required disabled={busy} /></label>
           <label className="form-field"><span>Password</span><input name="password" type="password" autoComplete={mode === 'create' ? 'new-password' : 'current-password'} minLength={mode === 'create' ? 8 : undefined} placeholder={mode === 'create' ? 'At least 8 characters' : 'Enter your password'} required disabled={busy} /></label>
           {mode === 'create' && <label className="form-field"><span>Confirm password</span><input name="confirmPassword" type="password" autoComplete="new-password" minLength="8" placeholder="Re-enter your password" required disabled={busy} /></label>}
           {error && <p className="local-auth-error" role="alert">{error}</p>}
-          <button type="submit" className="button button-primary local-auth-submit" disabled={busy || accountStoreFailed}>{busy ? 'Please wait…' : mode === 'create' ? 'Create account & open' : 'Open workspace'}</button>
+          <button type="submit" className="button button-primary local-auth-submit" disabled={busy || accountStoreFailed}>{busy ? 'Please wait…' : mode === 'create' ? storageMode === 'cloud' ? 'Create encrypted cloud account' : 'Create account & open' : storageMode === 'cloud' ? 'Sign in & sync' : 'Open workspace'}</button>
         </form>
         <button type="button" className="local-auth-switch" onClick={() => { setError(''); setMode(mode === 'create' ? 'login' : 'create'); }} disabled={busy || accountStoreFailed}>
-          {mode === 'create' ? 'Already have a local account? Sign in' : 'New here? Create an account'}
+          {mode === 'create' ? 'Already have an account? Sign in' : 'New here? Create an account'}
         </button>
-        <p className="local-auth-note">Open Gastoswell once while connected so the app files can cache, then use your browser’s Install app / Add to Home Screen option. Your data is encrypted and saved only on this device; there is no password recovery, so keep a backup.</p>
+        <button type="button" className="local-auth-switch" onClick={() => { setError(''); setStorageMode(storageMode === 'cloud' ? 'local' : 'cloud'); }} disabled={busy || accountStoreFailed}>
+          {storageMode === 'cloud' ? 'Use this device only' : 'Use encrypted cloud sync'}
+        </button>
+        <p className="local-auth-note">Your finance records are encrypted before storage. Keep your password safe; there is no password recovery. {storageMode === 'cloud' ? 'Cloud sync requires the server owner to configure MySQL.' : 'Local accounts stay on this device unless you enable cloud sync.'} Open Gastoswell once while online to install it for offline use.</p>
       </section>
     </main>
     <footer className="landing-footer">
@@ -366,8 +556,13 @@ function App({ profile, onLogout }) {
   const [toast, setToast] = useState('');
   const [error, setError] = useState('');
   const [migrationWarningDismissed, setMigrationWarningDismissed] = useState(false);
+  const [syncStatus, setSyncStatus] = useState(profile.syncConflict ? 'conflict' : profile.syncEnabled ? 'ready' : 'local');
+  const [syncConflict, setSyncConflict] = useState(profile.syncConflict || null);
+  const [syncRetry, setSyncRetry] = useState(0);
   const saveQueue = useRef(Promise.resolve());
   const saveVersion = useRef(0);
+  const syncVersion = useRef(profile.syncVersion || 1);
+  const syncPaused = useRef(Boolean(profile.syncConflict));
 
   useEffect(() => {
     document.documentElement.dataset.theme = data.theme;
@@ -377,8 +572,19 @@ function App({ profile, onLogout }) {
     if (!storageReady) return undefined;
     const version = ++saveVersion.current;
     const snapshot = data;
+    let localSaved = false;
     setSaveStatus('saving');
-    const save = saveQueue.current.catch(() => undefined).then(() => persistProfileData(profile, snapshot));
+    const save = saveQueue.current.catch(() => undefined).then(async () => {
+      const payload = await persistProfileData(profile, snapshot);
+      localSaved = true;
+      if (profile.syncEnabled && !syncPaused.current) {
+        setSyncStatus('syncing');
+        const result = await pushEncryptedWorkspace(profile, payload, syncVersion.current);
+        syncVersion.current = result.version;
+        updateLocalSyncState(profile.id, result.version);
+        setSyncStatus('synced');
+      }
+    });
     saveQueue.current = save;
     save.then(() => {
       if (saveVersion.current === version) {
@@ -386,25 +592,103 @@ function App({ profile, onLogout }) {
         setError('');
       }
     }).catch((saveError) => {
+      if (saveError && typeof saveError === 'object') saveError.localSaved = localSaved;
       if (saveVersion.current === version) {
-        setSaveStatus('offline');
-        setError(`Could not encrypt and save data on this device. ${saveError.message}`);
+        if (saveError.status === 409) {
+          syncPaused.current = true;
+          setSyncStatus('conflict');
+          setSyncConflict({
+            payload: saveError.result.payload,
+            version: saveError.result.version,
+            workspace: null
+          });
+          setSaveStatus('saved');
+          setError('');
+        } else if (localSaved) {
+          setSaveStatus('saved');
+          setSyncStatus('error');
+          setError(`Your data is saved on this device, but cloud sync failed. ${saveError.message}`);
+        } else {
+          setSaveStatus('offline');
+          setError(`Could not encrypt and save data on this device. ${saveError.message}`);
+        }
       }
     });
     return undefined;
-  }, [data, profile, storageReady]);
+  }, [data, profile, storageReady, syncRetry]);
 
   useEffect(() => {
     setStorageReady(true);
   }, []);
 
+  useEffect(() => {
+    if (!profile.syncEnabled) return undefined;
+    const retrySync = () => setSyncRetry((current) => current + 1);
+    window.addEventListener('online', retrySync);
+    return () => window.removeEventListener('online', retrySync);
+  }, [profile.syncEnabled]);
+
   async function lockWorkspace() {
+    let warning = '';
     try {
       await saveQueue.current;
-      onLogout();
     } catch (saveError) {
-      setSaveStatus('offline');
-      setError(`Could not encrypt and save data on this device. ${saveError.message}`);
+      if (saveError.localSaved) {
+        warning = `Your local copy is saved, but cloud sync did not finish. ${saveError.message}`;
+      } else {
+        setSaveStatus('offline');
+        setError(`Could not encrypt and save data on this device. ${saveError.message}`);
+        return;
+      }
+    }
+    if (profile.syncEnabled) {
+      try {
+        await syncRequest('/api/sync/logout', { method: 'POST' });
+      } catch (logoutError) {
+        warning = [warning, `The workspace was locked locally, but the cloud session could not be signed out. ${logoutError.message}`].filter(Boolean).join(' ');
+      }
+    }
+    onLogout(warning);
+  }
+
+  async function resolveSyncConflict(choice) {
+    if (!syncConflict) return;
+    syncPaused.current = true;
+    try {
+      await saveQueue.current.catch(() => undefined);
+      if (choice === 'cloud') {
+        const cloudWorkspace = syncConflict.workspace || await decryptWorkspace(syncConflict.payload, profile.key);
+        await persistProfileData(profile, cloudWorkspace);
+        syncVersion.current = syncConflict.version;
+        updateLocalSyncState(profile.id, syncConflict.version);
+        setData(cloudWorkspace);
+        setSyncConflict(null);
+        syncPaused.current = false;
+        setSyncStatus('synced');
+        setError('');
+        return;
+      }
+
+      const payload = await persistProfileData(profile, data);
+      const result = await pushEncryptedWorkspace(profile, payload, syncConflict.version);
+      syncVersion.current = result.version;
+      updateLocalSyncState(profile.id, result.version);
+      setSyncConflict(null);
+      syncPaused.current = false;
+      setSyncStatus('synced');
+      setError('');
+    } catch (syncError) {
+      if (syncError.status === 409) {
+        setSyncConflict({
+          payload: syncError.result.payload,
+          version: syncError.result.version,
+          workspace: null
+        });
+        setError('Another device updated the cloud workspace again. Review the latest copy before choosing.');
+      } else {
+        setSyncStatus('error');
+        setError(`Could not resolve the sync conflict. Your local data remains saved. ${syncError.message}`);
+      }
     }
   }
 
@@ -778,7 +1062,7 @@ function App({ profile, onLogout }) {
             <strong>Small steps add up.</strong>
             <p>A little progress today is still progress.</p>
           </div>
-          <button className="profile-button" onClick={exportBackup}><span className="avatar">{profile.username.slice(0, 1).toUpperCase()}</span><span><strong>{profile.username}</strong><small>Encrypted local account</small></span><Icon name="download" size={17} /></button>
+          <button className="profile-button" onClick={exportBackup}><span className="avatar">{profile.username.slice(0, 1).toUpperCase()}</span><span><strong>{profile.username}</strong><small>{profile.syncEnabled ? 'Encrypted cloud sync' : 'Encrypted local account'}</small></span><Icon name="download" size={17} /></button>
         </div>
       </aside>
 
@@ -787,7 +1071,7 @@ function App({ profile, onLogout }) {
           <div className="mobile-brand"><img className="brand-mark" src={gastoswellLogo} alt="" /><strong>gastoswell<span>.</span></strong></div>
           <div className="breadcrumbs"><span>Workspace</span><Icon name="chevron" size={14} /><strong>{NAV_ITEMS.find((item) => item.id === activePage)?.label}</strong></div>
           <div className="topbar-actions">
-            <span className={`save-indicator ${saveStatus}`}><i />{saveStatus === 'saving' ? 'Saving…' : saveStatus === 'offline' ? 'Local save failed' : 'Saved on this device'}</span>
+            <span className={`save-indicator ${saveStatus} ${profile.syncEnabled ? syncStatus : ''}`}><i />{saveStatus === 'saving' ? 'Saving…' : saveStatus === 'offline' ? 'Local save failed' : !profile.syncEnabled ? 'Saved on this device' : syncStatus === 'syncing' ? 'Syncing…' : syncStatus === 'synced' ? 'Saved & synced' : syncStatus === 'conflict' ? 'Sync conflict' : syncStatus === 'error' ? 'Sync issue' : 'Cloud sync on'}</span>
             <button className="icon-button theme-toggle" aria-label={`Switch to ${data.theme === 'dark' ? 'light' : 'dark'} mode`} title="Toggle appearance" onClick={() => patch({ theme: data.theme === 'dark' ? 'light' : 'dark' })}><Icon name={data.theme === 'dark' ? 'sun' : 'moon'} size={19} /></button>
             <button className="icon-button logout-button" aria-label="Lock and sign out" title={`Sign out ${profile.username}`} onClick={lockWorkspace}><Icon name="logout" size={18} /></button>
             <button className="button button-primary top-add" onClick={() => setModal('transaction')}><Icon name="plus" size={17} /><span>New transaction</span></button>
@@ -796,6 +1080,13 @@ function App({ profile, onLogout }) {
 
         <main className="main-content">
           {profile.warning && !migrationWarningDismissed && <div className="notice" role="alert"><span>{profile.warning}</span><button aria-label="Dismiss storage warning" onClick={() => setMigrationWarningDismissed(true)}><Icon name="close" size={16} /></button></div>}
+          {syncConflict && <div className="notice sync-conflict" role="alert">
+            <span>This workspace changed on another device. Choose which encrypted copy to keep. Your local copy has not been overwritten.</span>
+            <div className="sync-conflict-actions">
+              <button className="button button-quiet" onClick={() => resolveSyncConflict('cloud')}>Use cloud copy</button>
+              <button className="button button-primary" onClick={() => resolveSyncConflict('local')}>Keep this device</button>
+            </div>
+          </div>}
           {error && <div className="notice" role="status"><span>{error}</span><button aria-label="Dismiss" onClick={() => setError('')}><Icon name="close" size={16} /></button></div>}
           <section className="page-heading">
             <div><p className="eyebrow">{activePage === 'overview' ? 'YOUR FINANCIAL SNAPSHOT' : 'YOUR MONEY, ORGANIZED'}</p><h1>{activePage === 'overview' ? 'Good things are growing.' : NAV_ITEMS.find((item) => item.id === activePage)?.label}</h1><p className="page-subtitle">{activePage === 'overview' ? 'A clear picture of where you are, and where you’re headed.' : `Your ${NAV_ITEMS.find((item) => item.id === activePage)?.label.toLowerCase()} at a glance.`}</p></div>

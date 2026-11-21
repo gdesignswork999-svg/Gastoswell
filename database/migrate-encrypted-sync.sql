@@ -1,0 +1,13 @@
+ALTER TABLE users
+  ADD COLUMN key_salt VARCHAR(64) NULL AFTER username;
+
+CREATE TABLE IF NOT EXISTS encrypted_workspaces (
+  user_id VARCHAR(64) NOT NULL,
+  payload JSON NOT NULL,
+  version BIGINT UNSIGNED NOT NULL DEFAULT 1,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id),
+  CONSTRAINT fk_encrypted_workspaces_user
+    FOREIGN KEY (user_id) REFERENCES users (id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
